@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 import tkinter as tk
@@ -26,6 +27,8 @@ from Reveal import reveal
 from Riotidchanger import change_riotid
 from StatusChanger import change_status
 from settings import AppSettings
+
+logger = logging.getLogger("tiamat")
 
 
 class FormDialog(simpledialog.Dialog):
@@ -142,6 +145,7 @@ class TrayController:
         self._status_thread = None
         self._blink_on = False
         self._current_icon_frame = None
+        self._last_client_available = None
         self._icon_images = {
             "waiting": self._create_status_icon((238, 196, 55, 255), (255, 255, 255, 220)),
             "active_on": self._create_status_icon((46, 204, 113, 255), (255, 255, 255, 220)),
@@ -154,6 +158,7 @@ class TrayController:
             "Tiamat - Waiting for LoL",
             menu=self._build_menu(),
         )
+        logger.info("Tray controller initialized.")
 
     def _restore_services(self):
         self.auto_accept.set_enabled(self.settings.auto_accept_enabled)
@@ -175,7 +180,8 @@ class TrayController:
     def _on_icon_ready(self, icon):
         icon.visible = True
         self._set_icon_frame("waiting", "Tiamat - Waiting for LoL")
-        self._notify("O Tiamat foi iniciado!", "Tiamat")
+        self._notify("Tiamat has started!", "Tiamat")
+        logger.info("Tray icon is visible.")
         self._status_thread = threading.Thread(target=self._monitor_icon_status, daemon=True)
         self._status_thread.start()
 
@@ -192,8 +198,17 @@ class TrayController:
         self._current_icon_frame = frame_name
 
     def _monitor_icon_status(self):
+        logger.info("Tray status monitor started.")
         while not self._stop_event.is_set():
-            if self._is_league_client_available():
+            client_available = self._is_league_client_available()
+            if self._last_client_available is None or self._last_client_available != client_available:
+                logger.info(
+                    "League client availability changed: %s",
+                    "connected" if client_available else "waiting",
+                )
+                self._last_client_available = client_available
+
+            if client_available:
                 self._blink_on = not self._blink_on
                 frame_name = "active_on" if self._blink_on else "active_off"
                 title = "Tiamat - LoL connected"
@@ -207,9 +222,12 @@ class TrayController:
             try:
                 self._set_icon_frame(frame_name, title)
             except Exception:
+                logger.exception("Tray status monitor stopped after icon update failure.")
                 return
 
             self._stop_event.wait(delay)
+
+        logger.info("Tray status monitor stopped.")
 
     def _build_menu(self):
         item = pystray.MenuItem
@@ -248,7 +266,9 @@ class TrayController:
         )
 
     def run(self):
+        logger.info("Starting tray icon event loop.")
         self.icon.run(setup=self._on_icon_ready)
+        logger.info("Tray icon event loop stopped.")
 
     def _with_dialog_root(self, callback):
         root = tk.Tk()
@@ -305,10 +325,12 @@ class TrayController:
         try:
             return callback()
         except Exception as exc:
+            logger.exception("Tray menu callback failed.")
             self._show_error(str(exc))
             return None
 
     def _show_error(self, message):
+        logger.error("User-facing error: %s", message)
         self._with_dialog_root(
             lambda root: messagebox.showerror("Tiamat", message, parent=root)
         )
@@ -358,6 +380,7 @@ class TrayController:
         try:
             result = callback()
         except Exception as exc:
+            logger.exception("Tray action failed.")
             self._show_error(str(exc))
             return None
 
@@ -648,5 +671,6 @@ class TrayController:
         self._run_action(action, "Status updated.")
 
     def _quit(self, _icon, _item):
+        logger.info("Exit requested from tray menu.")
         self._stop_event.set()
         self.icon.stop()

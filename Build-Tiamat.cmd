@@ -8,7 +8,7 @@ set "SPEC_FILE=%ROOT_DIR%Tiamat.spec"
 set "PYTHON_CMD="
 
 if not exist "%APP_FILE%" (
-    echo Nao foi possivel localizar "%APP_FILE%".
+    echo Could not find "%APP_FILE%".
     exit /b 1
 )
 
@@ -27,8 +27,8 @@ if errorlevel 1 exit /b 1
 if exist "%SPEC_FILE%" (
     del /f /q "%SPEC_FILE%" >nul 2>nul
     if exist "%SPEC_FILE%" (
-        echo Nao foi possivel remover "%SPEC_FILE%".
-        echo Feche qualquer processo que esteja usando o arquivo e tente novamente.
+        echo Could not remove "%SPEC_FILE%".
+        echo Close any process using this file and try again.
         exit /b 1
     )
 )
@@ -48,8 +48,8 @@ if not defined PYTHON_CMD (
 )
 
 if not defined PYTHON_CMD (
-    echo Nenhum interpretador Python com PyInstaller, pystray e Pillow foi encontrado.
-    echo Instale as dependencias com: pip install -r tiamat\requirements.txt
+    echo No Python interpreter with PyInstaller, pystray and Pillow was found.
+    echo Install the dependencies with: pip install -r tiamat\requirements.txt
     exit /b 1
 )
 
@@ -58,13 +58,13 @@ set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
     echo.
-    echo Build falhou com codigo %EXIT_CODE%.
+    echo Build failed with exit code %EXIT_CODE%.
     exit /b %EXIT_CODE%
 )
 
 echo.
-echo Build concluido com sucesso.
-echo Executavel: "%ROOT_DIR%dist\Tiamat\Tiamat.exe"
+echo Build completed successfully.
+echo Executable: "%ROOT_DIR%dist\Tiamat\Tiamat.exe"
 exit /b 0
 
 :remove_dir
@@ -72,8 +72,8 @@ if not exist "%~1" exit /b 0
 
 rmdir /s /q "%~1" >nul 2>nul
 if exist "%~1" (
-    echo Nao foi possivel remover "%~1".
-    echo Feche o Tiamat ou qualquer processo usando essa pasta e tente novamente.
+    echo Could not remove "%~1".
+    echo Close Tiamat or any process using this folder and try again.
     exit /b 1
 )
 

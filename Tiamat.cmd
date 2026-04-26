@@ -7,7 +7,7 @@ set "APP_FILE=%ROOT_DIR%tiamat\tray_app.pyw"
 set "RUN_CMD="
 
 if not exist "%APP_FILE%" (
-    echo Nao foi possivel localizar "%APP_FILE%".
+    echo Could not find "%APP_FILE%".
     pause
     exit /b 1
 )
@@ -33,8 +33,8 @@ if not defined RUN_CMD (
 )
 
 if not defined RUN_CMD (
-    echo Nenhum interpretador Python com pystray e Pillow foi encontrado.
-    echo Instale as dependencias com: pip install -r tiamat\requirements.txt
+    echo No Python interpreter with pystray and Pillow was found.
+    echo Install the dependencies with: pip install -r tiamat\requirements.txt
     pause
     exit /b 1
 )
