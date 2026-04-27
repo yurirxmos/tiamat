@@ -1,8 +1,12 @@
 import logging
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
+import winreg
 
 import pystray
 from PIL import Image, ImageDraw
@@ -22,13 +26,24 @@ from Iconsclient import icon_client
 from InstalockAutoban import InstalockAutoban
 from RemoveFriends import remove_all_friends
 from RestartUX import restart
-from Rengar import check_league_client
+from Rengar import LeagueClientNotFoundError, check_league_client, get_shared_rengar
 from Reveal import reveal
 from Riotidchanger import change_riotid
 from StatusChanger import change_status
 from settings import AppSettings
 
 logger = logging.getLogger("tiamat")
+
+WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_RUN_VALUE_NAME = "Tiamat"
+ACCOUNT_NOT_DETECTED_LABEL = "Account: not detected"
+ACCOUNT_LP_UNRANKED_LABEL = "LP: unranked"
+ACCOUNT_LP_UNAVAILABLE_LABEL = "LP: unavailable"
+ACCOUNT_WIN_RATE_UNRANKED_LABEL = "Win rate: unranked"
+ACCOUNT_WIN_RATE_UNAVAILABLE_LABEL = "Win rate: unavailable"
+ACCOUNT_DETAILS_REFRESH_INTERVAL_SECONDS = 15.0
+ACCOUNT_DETAILS_RETRY_INTERVAL_SECONDS = 2.0
+SOLO_QUEUE_TYPE = "RANKED_SOLO_5x5"
 
 
 class FormDialog(simpledialog.Dialog):
@@ -100,7 +115,13 @@ class ListSelectionDialog(simpledialog.Dialog):
         frame = ttk.Frame(master)
         frame.grid(row=1, column=0, sticky="nsew")
 
-        self.listbox = tk.Listbox(frame, width=72, height=min(14, max(len(self.items), 6)))
+        self.listbox = tk.Listbox(
+            frame,
+            width=72,
+            height=min(14, max(len(self.items), 6)),
+            selectmode=tk.SINGLE,
+            exportselection=False,
+        )
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=scrollbar.set)
 
@@ -113,9 +134,11 @@ class ListSelectionDialog(simpledialog.Dialog):
         if self.items:
             index = min(max(self.initial_index, 0), len(self.items) - 1)
             self.listbox.selection_set(index)
+            self.listbox.activate(index)
             self.listbox.see(index)
 
         self.listbox.bind("<Double-Button-1>", lambda _event: self.ok())
+        self.listbox.bind("<Return>", lambda _event: self.ok())
 
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
@@ -128,6 +151,22 @@ class ListSelectionDialog(simpledialog.Dialog):
         self.attributes("-topmost", True)
         self.after(150, lambda: self.attributes("-topmost", False))
         self.focus_force()
+        if self.listbox is not None:
+            self.listbox.focus_set()
+
+    def validate(self):
+        selection = self.listbox.curselection()
+        if selection:
+            return True
+
+        active_index = self.listbox.index(tk.ACTIVE)
+        if 0 <= active_index < len(self.items):
+            self.listbox.selection_set(active_index)
+            self.listbox.activate(active_index)
+            return True
+
+        self.bell()
+        return False
 
     def apply(self):
         selection = self.listbox.curselection()
@@ -135,7 +174,8 @@ class ListSelectionDialog(simpledialog.Dialog):
 
 
 class TrayController:
-    def __init__(self):
+    def __init__(self, on_ready=None):
+        self._on_ready = on_ready
         self.settings = AppSettings.load()
         self.auto_accept = AutoAccept()
         self.instalock_autoban = InstalockAutoban()
@@ -145,6 +185,11 @@ class TrayController:
         self._status_thread = None
         self._blink_on = False
         self._current_icon_frame = None
+        self._current_account_name_label = ACCOUNT_NOT_DETECTED_LABEL
+        self._current_account_lp_label = ACCOUNT_LP_UNRANKED_LABEL
+        self._current_account_win_rate_label = ACCOUNT_WIN_RATE_UNRANKED_LABEL
+        self._show_account_ranked_details = False
+        self._next_account_refresh_at = 0.0
         self._last_client_available = None
         self._icon_images = {
             "waiting": self._create_status_icon((238, 196, 55, 255), (255, 255, 255, 220)),
@@ -180,6 +225,13 @@ class TrayController:
     def _on_icon_ready(self, icon):
         icon.visible = True
         self._set_icon_frame("waiting", "Tiamat - Waiting for LoL")
+
+        if self._on_ready is not None:
+            try:
+                self._on_ready()
+            except Exception:
+                logger.exception("Startup ready callback failed.")
+
         self._notify("Tiamat has started!", "Tiamat")
         logger.info("Tray icon is visible.")
         self._status_thread = threading.Thread(target=self._monitor_icon_status, daemon=True)
@@ -201,12 +253,34 @@ class TrayController:
         logger.info("Tray status monitor started.")
         while not self._stop_event.is_set():
             client_available = self._is_league_client_available()
-            if self._last_client_available is None or self._last_client_available != client_available:
+            current_time = time.monotonic()
+            availability_changed = (
+                self._last_client_available is None
+                or self._last_client_available != client_available
+            )
+            menu_changed = False
+
+            if availability_changed:
                 logger.info(
                     "League client availability changed: %s",
                     "connected" if client_available else "waiting",
                 )
                 self._last_client_available = client_available
+
+                if not client_available:
+                    menu_changed = self._set_account_menu_labels(ACCOUNT_NOT_DETECTED_LABEL)
+                    self._next_account_refresh_at = 0.0
+
+            if client_available and (
+                availability_changed or current_time >= self._next_account_refresh_at
+            ):
+                menu_changed = self._refresh_detected_account_details() or menu_changed
+                refresh_interval = (
+                    ACCOUNT_DETAILS_REFRESH_INTERVAL_SECONDS
+                    if self._show_account_ranked_details
+                    else ACCOUNT_DETAILS_RETRY_INTERVAL_SECONDS
+                )
+                self._next_account_refresh_at = current_time + refresh_interval
 
             if client_available:
                 self._blink_on = not self._blink_on
@@ -221,6 +295,8 @@ class TrayController:
 
             try:
                 self._set_icon_frame(frame_name, title)
+                if menu_changed:
+                    self._refresh_menu()
             except Exception:
                 logger.exception("Tray status monitor stopped after icon update failure.")
                 return
@@ -230,8 +306,11 @@ class TrayController:
         logger.info("Tray status monitor stopped.")
 
     def _build_menu(self):
+        return pystray.Menu(self._menu_items)
+
+    def _menu_items(self):
         item = pystray.MenuItem
-        return pystray.Menu(
+        configs_menu = pystray.Menu(
             item("Icon Changer", self._handle_profile_icon),
             item("Client-Only Icon Changer", self._handle_client_icon),
             item("Background Changer", self._handle_background_change),
@@ -262,8 +341,30 @@ class TrayController:
             item("Remove All Friends", self._handle_remove_friends),
             item("Change Profile Badges", self._handle_badges_change),
             item("Change Status", self._handle_status_change),
-            item("Exit", self._quit),
         )
+        menu_items = [item(self._current_account_name_label, self._noop, enabled=False)]
+
+        if self._show_account_ranked_details:
+            menu_items.extend(
+                [
+                    item(self._current_account_lp_label, self._noop, enabled=False),
+                    item(self._current_account_win_rate_label, self._noop, enabled=False),
+                    pystray.Menu.SEPARATOR,
+                ]
+            )
+
+        menu_items.extend(
+            [
+                item("Configs", configs_menu),
+                item(
+                    "Start with Windows",
+                    self._toggle_start_with_windows,
+                    checked=self._start_with_windows_checked,
+                ),
+                item("Exit", self._quit),
+            ]
+        )
+        return tuple(menu_items)
 
     def run(self):
         logger.info("Starting tray icon event loop.")
@@ -328,6 +429,9 @@ class TrayController:
             logger.exception("Tray menu callback failed.")
             self._show_error(str(exc))
             return None
+
+    def _noop(self, _icon, _item):
+        return None
 
     def _show_error(self, message):
         logger.error("User-facing error: %s", message)
@@ -395,6 +499,126 @@ class TrayController:
             self._refresh_menu()
         return result
 
+    def _set_account_menu_labels(
+        self,
+        name_label,
+        lp_label=ACCOUNT_LP_UNRANKED_LABEL,
+        win_rate_label=ACCOUNT_WIN_RATE_UNRANKED_LABEL,
+        show_ranked_details=False,
+    ):
+        current_state = (
+            self._current_account_name_label,
+            self._current_account_lp_label,
+            self._current_account_win_rate_label,
+            self._show_account_ranked_details,
+        )
+        new_state = (name_label, lp_label, win_rate_label, show_ranked_details)
+
+        if current_state == new_state:
+            return False
+
+        self._current_account_name_label = name_label
+        self._current_account_lp_label = lp_label
+        self._current_account_win_rate_label = win_rate_label
+        self._show_account_ranked_details = show_ranked_details
+        return True
+
+    def _format_detected_account_name_label(self, account_data):
+        game_name = str(account_data.get("gameName") or "").strip()
+        tag_line = str(account_data.get("tagLine") or "").strip()
+        display_name = str(account_data.get("displayName") or "").strip()
+        internal_name = str(account_data.get("internalName") or "").strip()
+
+        if game_name and tag_line:
+            return f"Account: {game_name}#{tag_line}"
+        if game_name:
+            return f"Account: {game_name}"
+        if display_name:
+            return f"Account: {display_name}"
+        if internal_name:
+            return f"Account: {internal_name}"
+        return ACCOUNT_NOT_DETECTED_LABEL
+
+    def _extract_solo_queue_stats(self, ranked_stats_data):
+        queue_map = ranked_stats_data.get("queueMap")
+        if isinstance(queue_map, dict):
+            queue_stats = queue_map.get(SOLO_QUEUE_TYPE)
+            if isinstance(queue_stats, dict):
+                return queue_stats
+
+        queues = ranked_stats_data.get("queues")
+        if isinstance(queues, list):
+            for queue_stats in queues:
+                if not isinstance(queue_stats, dict):
+                    continue
+                if str(queue_stats.get("queueType") or "").strip() == SOLO_QUEUE_TYPE:
+                    return queue_stats
+
+        return None
+
+    def _format_solo_queue_labels(self, ranked_stats_data):
+        queue_stats = self._extract_solo_queue_stats(ranked_stats_data)
+        if not queue_stats:
+            return ACCOUNT_LP_UNRANKED_LABEL, ACCOUNT_WIN_RATE_UNRANKED_LABEL
+
+        league_points = queue_stats.get("leaguePoints")
+        wins = queue_stats.get("wins")
+        losses = queue_stats.get("losses")
+
+        lp_label = (
+            f"LP: {league_points}"
+            if isinstance(league_points, int)
+            else ACCOUNT_LP_UNAVAILABLE_LABEL
+        )
+
+        if isinstance(wins, int) and isinstance(losses, int):
+            total_games = wins + losses
+            if total_games > 0:
+                win_rate = (wins / total_games) * 100
+                return lp_label, f"Win rate: {win_rate:.1f}%"
+            return lp_label, ACCOUNT_WIN_RATE_UNRANKED_LABEL
+
+        return lp_label, ACCOUNT_WIN_RATE_UNAVAILABLE_LABEL
+
+    def _refresh_detected_account_details(self):
+        try:
+            rengar = get_shared_rengar()
+            response = rengar.lcu_request(
+                "GET", "/lol-summoner/v1/current-summoner", ""
+            )
+            if response.status_code != 200:
+                return self._set_account_menu_labels(ACCOUNT_NOT_DETECTED_LABEL)
+
+            name_label = self._format_detected_account_name_label(response.json())
+            if name_label == ACCOUNT_NOT_DETECTED_LABEL:
+                return self._set_account_menu_labels(ACCOUNT_NOT_DETECTED_LABEL)
+
+            lp_label = ACCOUNT_LP_UNAVAILABLE_LABEL
+            win_rate_label = ACCOUNT_WIN_RATE_UNAVAILABLE_LABEL
+
+            try:
+                ranked_response = rengar.lcu_request(
+                    "GET", "/lol-ranked/v1/current-ranked-stats", ""
+                )
+                if ranked_response.status_code == 200:
+                    lp_label, win_rate_label = self._format_solo_queue_labels(
+                        ranked_response.json()
+                    )
+                elif ranked_response.status_code in (204, 404):
+                    lp_label = ACCOUNT_LP_UNRANKED_LABEL
+                    win_rate_label = ACCOUNT_WIN_RATE_UNRANKED_LABEL
+            except (LeagueClientNotFoundError, RuntimeError, ValueError):
+                pass
+
+            return self._set_account_menu_labels(
+                name_label,
+                lp_label,
+                win_rate_label,
+                show_ranked_details=True,
+            )
+        except (LeagueClientNotFoundError, RuntimeError, ValueError):
+            return self._set_account_menu_labels(ACCOUNT_NOT_DETECTED_LABEL)
+
     def _auto_accept_checked(self, _item):
         return self.auto_accept.auto_accept_enabled
 
@@ -406,6 +630,53 @@ class TrayController:
 
     def _chat_checked(self, _item):
         return self.chat.safe_refresh_state()
+
+    def _start_with_windows_checked(self, _item):
+        return self._get_start_with_windows_value() is not None
+
+    def _get_start_with_windows_value(self):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0, winreg.KEY_READ) as key:
+                value, _value_type = winreg.QueryValueEx(key, WINDOWS_RUN_VALUE_NAME)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError(f"Could not read Windows startup setting: {exc}") from exc
+
+        return value or None
+
+    def _get_start_with_windows_command(self):
+        if getattr(sys, "frozen", False):
+            return subprocess.list2cmdline([sys.executable])
+
+        executable_path = Path(sys.executable)
+        executable_name = executable_path.name.lower()
+        if executable_name == "python.exe":
+            pythonw_path = executable_path.with_name("pythonw.exe")
+            if pythonw_path.exists():
+                executable_path = pythonw_path
+
+        script_path = Path(__file__).with_name("tray_app.pyw").resolve()
+        return subprocess.list2cmdline([str(executable_path), str(script_path)])
+
+    def _set_start_with_windows_enabled(self, enabled):
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY) as key:
+                if enabled:
+                    winreg.SetValueEx(
+                        key,
+                        WINDOWS_RUN_VALUE_NAME,
+                        0,
+                        winreg.REG_SZ,
+                        self._get_start_with_windows_command(),
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, WINDOWS_RUN_VALUE_NAME)
+                    except FileNotFoundError:
+                        pass
+        except OSError as exc:
+            raise RuntimeError(f"Could not update Windows startup setting: {exc}") from exc
 
     def _handle_profile_icon(self, _icon, _item):
         icon_id = self._ask_string(
@@ -515,6 +786,7 @@ class TrayController:
             self.settings.last_riot_name = form_result["name"]
             self.settings.last_riot_tag = form_result["tag"]
             self.settings.save()
+            self._refresh_detected_account_details()
             return riot_id
 
         self._run_action(action, lambda riot_id: f"Riot ID changed to {riot_id}.")
@@ -669,6 +941,19 @@ class TrayController:
             return changed_status
 
         self._run_action(action, "Status updated.")
+
+    def _toggle_start_with_windows(self, _icon, _item):
+        def action():
+            enabled = not self._start_with_windows_checked(None)
+            self._set_start_with_windows_enabled(enabled)
+            return enabled
+
+        self._run_action(
+            action,
+            lambda enabled: "Tiamat will start with Windows."
+            if enabled
+            else "Tiamat will no longer start with Windows.",
+        )
 
     def _quit(self, _icon, _item):
         logger.info("Exit requested from tray menu.")
